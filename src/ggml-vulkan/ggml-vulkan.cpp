@@ -797,8 +797,6 @@ struct CompileTask {
     uint32_t required_subgroup_size;
 };
 
-static thread_local bool vk_prefetch_thread = false;
-
 struct vk_device_struct;
 static void ggml_vk_save_pipeline_cache(vk_device_struct & device);
 static void ggml_vk_save_pipeline_list(vk_device_struct & device);
@@ -2949,15 +2947,7 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
 #endif
 
     try {
-        const auto compile_start = std::chrono::steady_clock::now();
         pipeline->pipeline = device->device.createComputePipeline(device->pipeline_cache, compute_pipeline_create_info).value;
-        if (std::getenv("GGML_VK_PIPELINE_TIMES")) {
-            const auto compile_end = std::chrono::steady_clock::now();
-            std::fprintf(stderr, "ggml_vulkan: pipeline time %s %s start %lld ms took %lld ms\n",
-                         vk_prefetch_thread ? "bg" : "fg", pipeline->name.c_str(),
-                         (long long)std::chrono::duration_cast<std::chrono::milliseconds>(compile_start.time_since_epoch()).count(),
-                         (long long)std::chrono::duration_cast<std::chrono::milliseconds>(compile_end - compile_start).count());
-        }
         // Persist the pipeline cache periodically. _Exit() on Windows bypasses
         // ~vk_device_struct(), so relying on the destructor alone loses the
         // warmup work we just did.
@@ -4067,7 +4057,6 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
 }
 
 static void ggml_vk_prefetch_worker(vk_device device) {
-    vk_prefetch_thread = true;
 #if defined(_WIN32)
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 #endif
@@ -6148,10 +6137,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     if (!device->prefetch_queue.empty()) {
         const uint32_t hc = std::thread::hardware_concurrency();
-        uint32_t max_workers = hc > 2 ? hc - 1 : 1;
-        if (const char * threads = std::getenv("GGML_VK_PREFETCH_THREADS")) {
-            max_workers = std::max(1, std::atoi(threads));
-        }
+        const uint32_t max_workers = hc > 2 ? hc - 1 : 1;
         while (device->prefetch_workers < max_workers && device->prefetch_workers < device->prefetch_queue.size()) {
             device->prefetch_workers++;
             std::thread(ggml_vk_prefetch_worker, device).detach();
@@ -6173,15 +6159,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     // Another thread may be compiling the pipeline we need; block on it here.
     if (wait_pipeline) {
-        const auto wait_start = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> wait_lock(device->compile_mutex);
         device->compile_cv.wait(wait_lock, [&] {
             return wait_pipeline->compiled.load() || !wait_pipeline->compile_pending;
         });
-        if (std::getenv("GGML_VK_PIPELINE_TIMES")) {
-            std::fprintf(stderr, "ggml_vulkan: pipeline wait %s took %lld ms\n", wait_pipeline->name.c_str(),
-                         (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wait_start).count());
-        }
         if (!wait_pipeline->compiled) {
             wait_lock.unlock();
             ggml_vk_load_shaders(device, wait_pipeline);
