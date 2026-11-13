@@ -210,6 +210,8 @@ struct vk_pipeline_struct {
     // true while a compile is in flight, used to dedupe concurrent claims.
     // Protected by device->compile_mutex.
     bool compile_pending {};
+    // a queued size variant: background threads start it only once no other compile is pending
+    bool compile_deferred {};
     // set to true when the shader has been compiled
     std::atomic<bool> compiled {};
     // number of registers used, extracted from pipeline executable properties
@@ -815,6 +817,7 @@ struct vk_device_struct {
     // Variants of a just-requested shader, compiled by background workers.
     std::deque<CompileTask> prefetch_queue;
     uint32_t prefetch_workers {};
+    uint32_t urgent_compiles {};
     std::mutex pipeline_cache_write_mutex;
     std::mutex pipeline_list_write_mutex;
 
@@ -3024,7 +3027,11 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         std::lock_guard<std::mutex> guard(device->compile_mutex);
         device->all_pipelines.push_back(pipeline);
         pipeline->compiled = true;
+        if (pipeline->compile_pending && !pipeline->compile_deferred) {
+            device->urgent_compiles--;
+        }
         pipeline->compile_pending = false;
+        pipeline->compile_deferred = false;
     }
     device->compile_cv.notify_all();
 }
@@ -4072,9 +4079,19 @@ static void ggml_vk_prefetch_worker(vk_device device) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 #endif
     std::unique_lock<std::mutex> lock(device->compile_mutex);
-    while (!device->prefetch_queue.empty()) {
-        CompileTask task = std::move(device->prefetch_queue.front());
-        device->prefetch_queue.pop_front();
+    auto & queue = device->prefetch_queue;
+    while (!queue.empty()) {
+        auto next = std::find_if(queue.begin(), queue.end(),
+                                 [](const CompileTask & t) { return !t.pipeline->compile_deferred; });
+        if (next == queue.end()) {
+            if (device->urgent_compiles > 0) {
+                device->compile_cv.wait(lock);
+                continue;
+            }
+            next = queue.begin();
+        }
+        CompileTask task = std::move(*next);
+        queue.erase(next);
         lock.unlock();
         try {
             ggml_vk_create_pipeline_func(device, task.pipeline, task.spv_size, task.spv_data,
@@ -4085,7 +4102,11 @@ static void ggml_vk_prefetch_worker(vk_device device) {
         } catch (const vk::SystemError &) {
             // Leave it to the thread that actually requests this pipeline.
             lock.lock();
+            if (!task.pipeline->compile_deferred) {
+                device->urgent_compiles--;
+            }
             task.pipeline->compile_pending = false;
+            task.pipeline->compile_deferred = false;
             device->compile_cv.notify_all();
         }
     }
@@ -4470,8 +4491,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested, const
                 claimed_task = std::move(*queued);
                 device->prefetch_queue.erase(queued);
                 has_claimed_task = true;
+                if (pipeline->compile_deferred) {
+                    pipeline->compile_deferred = false;
+                    device->urgent_compiles++;
+                }
             } else if (!pipeline->compile_pending) {
                 pipeline->compile_pending = true;
+                device->urgent_compiles++;
                 claimed_task.pipeline = pipeline;
                 claimed_task.spv_size = spv_size;
                 claimed_task.spv_data = spv_data;
@@ -6160,6 +6186,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested, const
                                     c.specialization_constants.back() != spec.back();
             if (other_size || other_cols) {
                 c.pipeline->compile_pending = true;
+                c.pipeline->compile_deferred = true;
                 device->prefetch_queue.push_back(std::move(c));
             }
         }
@@ -6178,6 +6205,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested, const
         for (auto & t : wanted_tasks) {
             if (t.pipeline && !t.pipeline->compiled && !t.pipeline->compile_pending) {
                 t.pipeline->compile_pending = true;
+                device->urgent_compiles++;
                 device->prefetch_queue.push_back(std::move(t));
                 queued++;
             }
@@ -6208,6 +6236,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested, const
         for (auto & t : rebuild_tasks) {
             if (t.pipeline && !t.pipeline->compiled && !t.pipeline->compile_pending) {
                 t.pipeline->compile_pending = true;
+                device->urgent_compiles++;
                 device->prefetch_queue.push_back(std::move(t));
                 queued++;
             }
@@ -6230,6 +6259,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested, const
             device->prefetch_workers++;
             worker.detach();
         }
+        device->compile_cv.notify_all();
     }
 
     // Drop compile_mutex so other threads can walk while we compile.
