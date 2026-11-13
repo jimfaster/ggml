@@ -214,6 +214,9 @@ struct vk_pipeline_struct {
     std::atomic<bool> compiled {};
     // number of registers used, extracted from pipeline executable properties
     uint32_t register_count {};
+    // stable across runs and drivers; names this pipeline in the device's remembered list
+    std::string identity;
+    std::atomic<bool> listed {};
 
 #if defined(VK_EXT_shader_64bit_indexing)
     bool is_64b_indexing {};
@@ -598,6 +601,17 @@ struct vk_fa_pipeline_state {
     }
 };
 
+#define GGML_VK_FA_IDENTITY_FORMAT "fa#%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u"
+
+static std::string ggml_vk_fa_identity(const vk_fa_pipeline_state & s) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), GGML_VK_FA_IDENTITY_FORMAT,
+                  s.HSK, s.HSV, s.Br, s.Bc, s.D_split, s.row_split, (unsigned)s.shmem_staging, (unsigned)s.path,
+                  s.workgroup_size, s.subgroup_size, (unsigned)s.aligned, (unsigned)s.f32acc, s.flags,
+                  s.limit_occupancy_shmem, (unsigned)s.k_type, (unsigned)s.v_type);
+    return buf;
+}
+
 struct vk_conv2d_pipeline_state {
     vk_conv2d_pipeline_state(uint32_t s0, uint32_t s1, uint32_t p0, uint32_t p1, uint32_t d0, uint32_t d1, uint32_t KW, uint32_t KH, uint32_t aligned)
         : s0(s0), s1(s1), p0(p0), p1(p1), d0(d0), d1(d1), KW(KW), KH(KH), aligned(aligned) {}
@@ -783,6 +797,12 @@ struct CompileTask {
     uint32_t required_subgroup_size;
 };
 
+static thread_local bool vk_prefetch_thread = false;
+
+struct vk_device_struct;
+static void ggml_vk_save_pipeline_cache(vk_device_struct & device);
+static void ggml_vk_save_pipeline_list(vk_device_struct & device);
+
 struct vk_device_struct {
     std::recursive_mutex mutex;
     mutable std::shared_mutex pinned_memory_mutex;
@@ -815,6 +835,12 @@ struct vk_device_struct {
     std::string pipeline_cache_path;
     std::atomic<uint32_t> pipeline_cache_dirty {0};
     uint32_t pipeline_cache_save_every {4};  // persist every N new pipelines
+    // Identities of the pipelines this device has used, in first-use order. Kept per
+    // device and independent of the driver, so a driver update can rebuild them in the
+    // background. pipeline_list_driver is the driver they were last all built for.
+    std::string pipeline_list_path;
+    std::vector<std::string> pipeline_list;
+    uint32_t pipeline_list_driver {};
     uint32_t vendor_id;
     vk::DriverId driver_id;
     vk_device_architecture architecture;
@@ -1143,16 +1169,7 @@ struct vk_device_struct {
         device.destroyDescriptorSetLayout(dsl);
 
         if (pipeline_cache) {
-            try {
-                std::vector<uint8_t> data = device.getPipelineCacheData(pipeline_cache);
-                if (!data.empty() && !pipeline_cache_path.empty()) {
-                    ggml_vk_write_pipeline_cache(pipeline_cache_path, data);
-                    GGML_LOG_DEBUG("ggml_vulkan: saved pipeline cache (%zu bytes) to %s\n",
-                                   data.size(), pipeline_cache_path.c_str());
-                }
-            } catch (const vk::SystemError &) {
-                // Non-fatal: cache just won't persist this session.
-            }
+            ggml_vk_save_pipeline_cache(*this);
             device.destroyPipelineCache(pipeline_cache);
             pipeline_cache = VK_NULL_HANDLE;
         }
@@ -1160,6 +1177,40 @@ struct vk_device_struct {
         device.destroy();
     }
 };
+
+static void ggml_vk_save_pipeline_cache(vk_device_struct & device) {
+    std::lock_guard<std::mutex> write_guard(device.pipeline_cache_write_mutex);
+    try {
+        std::vector<uint8_t> data = device.device.getPipelineCacheData(device.pipeline_cache);
+        if (!data.empty()) {
+            ggml_vk_write_pipeline_cache(device.pipeline_cache_path, data);
+            if (std::getenv("GGML_VK_PIPELINE_CACHE_DEBUG")) {
+                std::fprintf(stderr, "ggml_vulkan: saved pipeline cache (%zu bytes) to %s\n",
+                             data.size(), device.pipeline_cache_path.c_str());
+            }
+        }
+    } catch (const vk::SystemError & e) {
+        if (std::getenv("GGML_VK_PIPELINE_CACHE_DEBUG")) {
+            std::fprintf(stderr, "ggml_vulkan: pipeline cache save failed: %s\n", e.what());
+        }
+    }
+}
+
+static void ggml_vk_save_pipeline_list(vk_device_struct & device) {
+    std::lock_guard<std::mutex> write_guard(device.pipeline_cache_write_mutex);
+    std::string text;
+    {
+        std::lock_guard<std::mutex> guard(device.compile_mutex);
+        char marker[32];
+        std::snprintf(marker, sizeof(marker), "driver %08x\n", (unsigned)device.pipeline_list_driver);
+        text = marker;
+        for (const auto & identity : device.pipeline_list) {
+            text += identity;
+            text += '\n';
+        }
+    }
+    ggml_vk_write_pipeline_cache(device.pipeline_list_path, std::vector<uint8_t>(text.begin(), text.end()));
+}
 
 void vk_command_pool::init(vk_device& device, vk_queue *q_) {
     cmd_buffers.clear();
@@ -2899,7 +2950,15 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
 #endif
 
     try {
+        const auto compile_start = std::chrono::steady_clock::now();
         pipeline->pipeline = device->device.createComputePipeline(device->pipeline_cache, compute_pipeline_create_info).value;
+        if (std::getenv("GGML_VK_PIPELINE_TIMES")) {
+            const auto compile_end = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "ggml_vulkan: pipeline time %s %s start %lld ms took %lld ms\n",
+                         vk_prefetch_thread ? "bg" : "fg", pipeline->name.c_str(),
+                         (long long)std::chrono::duration_cast<std::chrono::milliseconds>(compile_start.time_since_epoch()).count(),
+                         (long long)std::chrono::duration_cast<std::chrono::milliseconds>(compile_end - compile_start).count());
+        }
         // Persist the pipeline cache periodically. _Exit() on Windows bypasses
         // ~vk_device_struct(), so relying on the destructor alone loses the
         // warmup work we just did.
@@ -2908,21 +2967,7 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
             if (dirty >= device->pipeline_cache_save_every) {
                 const uint32_t pending = device->pipeline_cache_dirty.exchange(0, std::memory_order_acq_rel);
                 if (pending >= device->pipeline_cache_save_every) {
-                    std::lock_guard<std::mutex> write_guard(device->pipeline_cache_write_mutex);
-                    try {
-                        std::vector<uint8_t> data = device->device.getPipelineCacheData(device->pipeline_cache);
-                        if (!data.empty()) {
-                            ggml_vk_write_pipeline_cache(device->pipeline_cache_path, data);
-                            if (std::getenv("GGML_VK_PIPELINE_CACHE_DEBUG")) {
-                                std::fprintf(stderr, "ggml_vulkan: saved pipeline cache (%zu bytes, after %u pipelines) to %s\n",
-                                             data.size(), pending, device->pipeline_cache_path.c_str());
-                            }
-                        }
-                    } catch (const vk::SystemError & e) {
-                        if (std::getenv("GGML_VK_PIPELINE_CACHE_DEBUG")) {
-                            std::fprintf(stderr, "ggml_vulkan: pipeline cache save failed: %s\n", e.what());
-                        }
-                    }
+                    ggml_vk_save_pipeline_cache(*device);
                 }
             }
         }
@@ -3002,6 +3047,23 @@ static void ggml_pipeline_request_descriptor_sets(ggml_backend_vk_context *ctx, 
     ctx->pipeline_descriptor_set_requirements += n;
     if (!pipeline->compiled) {
         ggml_vk_load_shaders(ctx->device, pipeline);
+    }
+    if (!pipeline->listed.load(std::memory_order_relaxed)) {
+        vk_device & device = ctx->device;
+        bool added = false;
+        {
+            std::lock_guard<std::mutex> guard(device->compile_mutex);
+            auto & list = device->pipeline_list;
+            if (!device->pipeline_list_path.empty() && !pipeline->identity.empty() &&
+                std::find(list.begin(), list.end(), pipeline->identity) == list.end()) {
+                list.push_back(pipeline->identity);
+                added = true;
+            }
+            pipeline->listed = true;
+        }
+        if (added) {
+            ggml_vk_save_pipeline_list(*device);
+        }
     }
     ggml_pipeline_allocate_descriptor_sets(ctx);
 }
@@ -4006,6 +4068,10 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
 }
 
 static void ggml_vk_prefetch_worker(vk_device device) {
+    vk_prefetch_thread = true;
+#if defined(_WIN32)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
     std::unique_lock<std::mutex> lock(device->compile_mutex);
     while (!device->prefetch_queue.empty()) {
         CompileTask task = std::move(device->prefetch_queue.front());
@@ -4025,6 +4091,19 @@ static void ggml_vk_prefetch_worker(vk_device device) {
         }
     }
     device->prefetch_workers--;
+    const bool rebuilt = device->prefetch_workers == 0 && device->pipeline_list_driver != device->properties.driverVersion;
+    if (rebuilt) {
+        device->pipeline_list_driver = device->properties.driverVersion;
+    }
+    lock.unlock();
+    if (rebuilt) {
+        if (std::getenv("GGML_VK_PIPELINE_CACHE_DEBUG")) {
+            std::fprintf(stderr, "ggml_vulkan: remembered pipelines rebuilt for driver %08x\n",
+                         (unsigned)device->properties.driverVersion);
+        }
+        ggml_vk_save_pipeline_cache(*device);
+        ggml_vk_save_pipeline_list(*device);
+    }
 }
 
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
@@ -4073,6 +4152,18 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     std::string requested_base;
     bool requested_64b = false;
     std::vector<CompileTask> sibling_candidates;
+
+    // After a driver change the remembered pipelines are rebuilt in the background,
+    // in the order they were first used.
+    std::unordered_map<std::string, size_t> remembered;
+    std::vector<CompileTask> rebuild_tasks;
+    if (!requested && device->pipeline_list_driver != device->properties.driverVersion) {
+        for (size_t i = 0; i < device->pipeline_list.size(); ++i) {
+            remembered.emplace(device->pipeline_list[i], i);
+        }
+        rebuild_tasks.resize(device->pipeline_list.size());
+    }
+    std::unordered_map<std::string, uint32_t> name_ordinals;
     if (requested) {
         requested_base = requested->name;
         const size_t n = requested_base.size();
@@ -4273,13 +4364,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     auto const &ggml_vk_create_pipeline = [&](vk_device& device, vk_pipeline& base_pipeline, const char *name, size_t spv_size, const void* spv_data, const char *entrypoint,
                                               uint32_t parameter_count, uint32_t push_constant_size, std::array<uint32_t, 3> wg_denoms, const std::vector<uint32_t>& specialization_constants,
-                                              uint32_t align, bool disable_robustness = false, bool require_full_subgroups = false, uint32_t required_subgroup_size = 0) {
+                                              uint32_t align, bool disable_robustness = false, bool require_full_subgroups = false, uint32_t required_subgroup_size = 0,
+                                              const std::string & identity = std::string()) {
 
         if (!require_full_subgroups && required_subgroup_size == 0) {
             required_subgroup_size = get_subgroup_size(name, device->architecture);
         }
 
         vk_pipeline *ptr = &base_pipeline;
+        std::string base_identity = identity;
 
         int num_pipelines = 1;
 #if defined(VK_EXT_shader_64bit_indexing)
@@ -4302,12 +4395,25 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #if defined(VK_EXT_shader_64bit_indexing)
                 pipeline->is_64b_indexing = (i == 1);
 #endif
+                if (base_identity.empty()) {
+                    base_identity = std::string(name) + "#" + std::to_string(name_ordinals[name]++);
+                }
+                pipeline->identity = i == 1 ? base_identity + "#64" : base_identity;
             }
 
             // We only care about the pipeline this call asked for; the rest
             // (including the 64-bit indexing variant) are handled by their
             // own request_descriptor_sets / load_shaders calls.
             if (pipeline.get() != requested.get()) {
+                if (!requested) {
+                    auto it = remembered.find(pipeline->identity);
+                    if (it != remembered.end()) {
+                        rebuild_tasks[it->second] = { pipeline, spv_size, spv_data, entrypoint, parameter_count, wg_denoms,
+                                                      specialization_constants, disable_robustness, require_full_subgroups,
+                                                      required_subgroup_size };
+                    }
+                    continue;
+                }
                 const std::string & n = pipeline->name;
                 const size_t b = requested_base.size();
                 if (requested && !pipeline->compiled && !pipeline->compile_pending && (i == 1) == requested_64b &&
@@ -4407,7 +4513,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 7,
                                 sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                 get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
-                                !fa_ds, !fa_ds ? fa_sgs : 0);
+                                !fa_ds, !fa_ds ? fa_sgs : 0, ggml_vk_fa_identity(fa.first));
     }
 
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
@@ -4443,7 +4549,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 7,
                                     sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                     get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
-                                    !fa_ds, !fa_ds ? fa_sgs : 0);
+                                    !fa_ds, !fa_ds ? fa_sgs : 0, ggml_vk_fa_identity(fa.first));
         }
     }
 #endif
@@ -4479,7 +4585,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
             ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 7,
                                     sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
-                                    get_fa_spec_constants(fa.first), aligned ? Bc : 1, true, false, 0);
+                                    get_fa_spec_constants(fa.first), aligned ? Bc : 1, true, false, 0,
+                                    ggml_vk_fa_identity(fa.first));
         }
     }
 #endif
@@ -6019,8 +6126,32 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 device->prefetch_queue.push_back(std::move(c));
             }
         }
+    }
+
+    if (!requested && device->pipeline_list_driver != device->properties.driverVersion) {
+        size_t queued = 0;
+        for (auto & t : rebuild_tasks) {
+            if (t.pipeline && !t.pipeline->compiled && !t.pipeline->compile_pending) {
+                t.pipeline->compile_pending = true;
+                device->prefetch_queue.push_back(std::move(t));
+                queued++;
+            }
+        }
+        if (std::getenv("GGML_VK_PIPELINE_CACHE_DEBUG")) {
+            std::fprintf(stderr, "ggml_vulkan: rebuilding %zu of %zu remembered pipelines for driver %08x\n",
+                         queued, device->pipeline_list.size(), (unsigned)device->properties.driverVersion);
+        }
+        if (queued == 0) {
+            device->pipeline_list_driver = device->properties.driverVersion;
+        }
+    }
+
+    if (!device->prefetch_queue.empty()) {
         const uint32_t hc = std::thread::hardware_concurrency();
-        const uint32_t max_workers = hc > 2 ? hc - 1 : 1;
+        uint32_t max_workers = hc > 2 ? hc - 1 : 1;
+        if (const char * threads = std::getenv("GGML_VK_PREFETCH_THREADS")) {
+            max_workers = std::max(1, std::atoi(threads));
+        }
         while (device->prefetch_workers < max_workers && device->prefetch_workers < device->prefetch_queue.size()) {
             device->prefetch_workers++;
             std::thread(ggml_vk_prefetch_worker, device).detach();
@@ -6042,10 +6173,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     // Another thread may be compiling the pipeline we need; block on it here.
     if (wait_pipeline) {
+        const auto wait_start = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> wait_lock(device->compile_mutex);
         device->compile_cv.wait(wait_lock, [&] {
             return wait_pipeline->compiled.load() || !wait_pipeline->compile_pending;
         });
+        if (std::getenv("GGML_VK_PIPELINE_TIMES")) {
+            std::fprintf(stderr, "ggml_vulkan: pipeline wait %s took %lld ms\n", wait_pipeline->name.c_str(),
+                         (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wait_start).count());
+        }
         if (!wait_pipeline->compiled) {
             wait_lock.unlock();
             ggml_vk_load_shaders(device, wait_pipeline);
@@ -6818,6 +6954,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         // Persistent pipeline cache (huge first-run latency win on drivers
         // that don't aggressively cache shader native compilation themselves).
         {
+            device->pipeline_list_driver = device->properties.driverVersion;
             const char * disable = std::getenv("GGML_VK_DISABLE_PIPELINE_CACHE");
             const bool cache_enabled = !(disable && *disable && disable[0] != '0');
             if (cache_enabled) {
@@ -6843,6 +6980,49 @@ static vk_device ggml_vk_get_device(size_t idx) {
                         device->pipeline_cache = VK_NULL_HANDLE;
                         device->pipeline_cache_path.clear();
                     }
+                }
+            }
+            if (device->pipeline_cache) {
+                char fname[96];
+                std::snprintf(fname, sizeof(fname), "v1_vendor%04x_device%04x_pipelines.txt",
+                              (unsigned)device->properties.vendorID, (unsigned)device->properties.deviceID);
+#if defined(_WIN32)
+                device->pipeline_list_path = ggml_vk_pipeline_cache_dir() + "\\" + fname;
+#else
+                device->pipeline_list_path = ggml_vk_pipeline_cache_dir() + "/" + fname;
+#endif
+                std::ifstream list_file(device->pipeline_list_path);
+                std::string line;
+                unsigned list_driver = 0;
+                if (std::getline(list_file, line) && std::sscanf(line.c_str(), "driver %x", &list_driver) == 1) {
+                    while (std::getline(list_file, line)) {
+                        if (!line.empty()) {
+                            device->pipeline_list.push_back(line);
+                        }
+                    }
+                }
+                if (!device->pipeline_list.empty()) {
+                    device->pipeline_list_driver = list_driver;
+                }
+                if (device->pipeline_list_driver != device->properties.driverVersion) {
+                    for (const auto & identity : device->pipeline_list) {
+                        unsigned v[16];
+                        if (std::sscanf(identity.c_str(), GGML_VK_FA_IDENTITY_FORMAT, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5],
+                                        &v[6], &v[7], &v[8], &v[9], &v[10], &v[11], &v[12], &v[13], &v[14], &v[15]) != 16) {
+                            continue;
+                        }
+                        vk_fa_pipeline_state s {};
+                        s.HSK = v[0]; s.HSV = v[1]; s.Br = v[2]; s.Bc = v[3]; s.D_split = v[4]; s.row_split = v[5];
+                        s.shmem_staging = v[6] != 0; s.path = (FaCodePath)v[7]; s.workgroup_size = v[8]; s.subgroup_size = v[9];
+                        s.aligned = v[10] != 0; s.f32acc = v[11] != 0; s.flags = v[12]; s.limit_occupancy_shmem = v[13];
+                        s.k_type = (ggml_type)v[14]; s.v_type = (ggml_type)v[15];
+                        device->pipeline_flash_attn_f32_f16.emplace(s, std::make_shared<vk_pipeline_struct>());
+                    }
+                }
+                if (std::getenv("GGML_VK_PIPELINE_CACHE_DEBUG")) {
+                    std::fprintf(stderr, "ggml_vulkan: %zu remembered pipelines (listed under driver %08x) in %s\n",
+                                 device->pipeline_list.size(), (unsigned)device->pipeline_list_driver,
+                                 device->pipeline_list_path.c_str());
                 }
             }
         }
