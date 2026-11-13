@@ -319,9 +319,15 @@ static void ggml_vk_write_pipeline_cache(const std::string & path, const std::ve
             // ignore ec: write will fail below if the dir really can't be created
         }
     } catch (...) { /* fs::path can throw on malformed input; fall through */ }
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
-    if (!f.is_open()) return;
-    f.write(reinterpret_cast<const char*>(data.data()), (std::streamsize)data.size());
+    const std::string partial = path + ".partial";
+    {
+        std::ofstream f(partial, std::ios::binary | std::ios::trunc);
+        if (!f.is_open()) return;
+        f.write(reinterpret_cast<const char*>(data.data()), (std::streamsize)data.size());
+        if (!f) return;
+    }
+    std::error_code ec;
+    std::filesystem::rename(partial, path, ec);
 }
 
 struct vk_buffer_struct;
@@ -760,6 +766,22 @@ static constexpr std::initializer_list<std::array<int, 3>> rms_norm_mul_rope_vie
     { 4, 0, 3 }, // set_rows->src[0] == view
 };
 
+// load_shaders walks the pipeline list under compile_mutex and either claims
+// the requested pipeline for compilation or, if another thread is already
+// compiling it, drops the lock and waits on compile_cv. Compiles themselves
+// run unlocked.
+struct CompileTask {
+    vk_pipeline pipeline;
+    size_t spv_size;
+    const void * spv_data;
+    std::string entrypoint;
+    uint32_t parameter_count;
+    std::array<uint32_t, 3> wg_denoms;
+    std::vector<uint32_t> specialization_constants;
+    bool disable_robustness;
+    bool require_full_subgroups;
+    uint32_t required_subgroup_size;
+};
 
 struct vk_device_struct {
     std::recursive_mutex mutex;
@@ -771,6 +793,10 @@ struct vk_device_struct {
     // Lock order is device->mutex -> compile_mutex, never the reverse.
     std::mutex compile_mutex;
     std::condition_variable compile_cv;
+    // Variants of a just-requested shader, compiled by background workers.
+    std::deque<CompileTask> prefetch_queue;
+    uint32_t prefetch_workers {};
+    std::mutex pipeline_cache_write_mutex;
 
     vk::PhysicalDevice physical_device;
     vk::PhysicalDeviceProperties properties;
@@ -2882,6 +2908,7 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
             if (dirty >= device->pipeline_cache_save_every) {
                 const uint32_t pending = device->pipeline_cache_dirty.exchange(0, std::memory_order_acq_rel);
                 if (pending >= device->pipeline_cache_save_every) {
+                    std::lock_guard<std::mutex> write_guard(device->pipeline_cache_write_mutex);
                     try {
                         std::vector<uint8_t> data = device->device.getPipelineCacheData(device->pipeline_cache);
                         if (!data.empty()) {
@@ -3978,22 +4005,27 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
 #endif
 }
 
-// load_shaders walks the pipeline list under compile_mutex and either claims
-// the requested pipeline for compilation or, if another thread is already
-// compiling it, drops the lock and waits on compile_cv. Compiles themselves
-// run unlocked.
-struct CompileTask {
-    vk_pipeline pipeline;
-    size_t spv_size;
-    const void * spv_data;
-    std::string entrypoint;
-    uint32_t parameter_count;
-    std::array<uint32_t, 3> wg_denoms;
-    std::vector<uint32_t> specialization_constants;
-    bool disable_robustness;
-    bool require_full_subgroups;
-    uint32_t required_subgroup_size;
-};
+static void ggml_vk_prefetch_worker(vk_device device) {
+    std::unique_lock<std::mutex> lock(device->compile_mutex);
+    while (!device->prefetch_queue.empty()) {
+        CompileTask task = std::move(device->prefetch_queue.front());
+        device->prefetch_queue.pop_front();
+        lock.unlock();
+        try {
+            ggml_vk_create_pipeline_func(device, task.pipeline, task.spv_size, task.spv_data,
+                                         task.entrypoint, task.parameter_count, task.wg_denoms,
+                                         task.specialization_constants, task.disable_robustness,
+                                         task.require_full_subgroups, task.required_subgroup_size);
+            lock.lock();
+        } catch (const vk::SystemError &) {
+            // Leave it to the thread that actually requests this pipeline.
+            lock.lock();
+            task.pipeline->compile_pending = false;
+            device->compile_cv.notify_all();
+        }
+    }
+    device->prefetch_workers--;
+}
 
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
@@ -4035,6 +4067,23 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // The rest of the walk reads and writes shared device state, so hold the
     // lock until we're done deciding what to compile.
     std::unique_lock<std::mutex> compile_lock(device->compile_mutex);
+
+    // Size (_s/_m/_l) and column-count variants of the requested shader are
+    // usually needed soon after it, so they are compiled in the background.
+    std::string requested_base;
+    bool requested_64b = false;
+    std::vector<CompileTask> sibling_candidates;
+    if (requested) {
+        requested_base = requested->name;
+        const size_t n = requested_base.size();
+        if (n > 2 && requested_base[n - 2] == '_' &&
+            (requested_base[n - 1] == 's' || requested_base[n - 1] == 'm' || requested_base[n - 1] == 'l')) {
+            requested_base.resize(n - 2);
+        }
+#if defined(VK_EXT_shader_64bit_indexing)
+        requested_64b = requested->is_64b_indexing;
+#endif
+    }
 
     if (device->coopmat2) {
         // spec constants and tile sizes for non-quant matmul/matmul_id
@@ -4259,6 +4308,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // (including the 64-bit indexing variant) are handled by their
             // own request_descriptor_sets / load_shaders calls.
             if (pipeline.get() != requested.get()) {
+                const std::string & n = pipeline->name;
+                const size_t b = requested_base.size();
+                if (requested && !pipeline->compiled && !pipeline->compile_pending && (i == 1) == requested_64b &&
+                    n.compare(0, b, requested_base) == 0 &&
+                    (n.size() == b || (n.size() == b + 2 && n[b] == '_' && (n[b + 1] == 's' || n[b + 1] == 'm' || n[b + 1] == 'l')))) {
+                    sibling_candidates.push_back({ pipeline, spv_size, spv_data, entrypoint, parameter_count, wg_denoms,
+                                                   specialization_constants, disable_robustness, require_full_subgroups,
+                                                   required_subgroup_size });
+                }
                 continue;
             }
 
@@ -4268,7 +4326,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             wait_pipeline = pipeline;
 
-            if (!pipeline->compile_pending) {
+            auto queued = std::find_if(device->prefetch_queue.begin(), device->prefetch_queue.end(),
+                                       [&](const CompileTask & t) { return t.pipeline == pipeline; });
+            if (queued != device->prefetch_queue.end()) {
+                claimed_task = std::move(*queued);
+                device->prefetch_queue.erase(queued);
+                has_claimed_task = true;
+            } else if (!pipeline->compile_pending) {
                 pipeline->compile_pending = true;
                 claimed_task.pipeline = pipeline;
                 claimed_task.spv_size = spv_size;
@@ -5941,6 +6005,28 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
+    if (has_claimed_task) {
+        const auto & spec = claimed_task.specialization_constants;
+        for (auto & c : sibling_candidates) {
+            const bool same_shader = c.spv_data == claimed_task.spv_data;
+            const bool other_size = c.pipeline->name != claimed_task.pipeline->name;
+            const bool other_cols = !other_size && !spec.empty() &&
+                                    c.specialization_constants.size() == spec.size() &&
+                                    std::equal(spec.begin(), spec.end() - 1, c.specialization_constants.begin()) &&
+                                    c.specialization_constants.back() != spec.back();
+            if (same_shader && (other_size || other_cols) && !c.pipeline->compile_pending) {
+                c.pipeline->compile_pending = true;
+                device->prefetch_queue.push_back(std::move(c));
+            }
+        }
+        const uint32_t hc = std::thread::hardware_concurrency();
+        const uint32_t max_workers = hc > 2 ? hc - 1 : 1;
+        while (device->prefetch_workers < max_workers && device->prefetch_workers < device->prefetch_queue.size()) {
+            device->prefetch_workers++;
+            std::thread(ggml_vk_prefetch_worker, device).detach();
+        }
+    }
+
     // Drop compile_mutex so other threads can walk while we compile.
     compile_lock.unlock();
 
@@ -5958,8 +6044,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (wait_pipeline) {
         std::unique_lock<std::mutex> wait_lock(device->compile_mutex);
         device->compile_cv.wait(wait_lock, [&] {
-            return wait_pipeline->compiled.load();
+            return wait_pipeline->compiled.load() || !wait_pipeline->compile_pending;
         });
+        if (!wait_pipeline->compiled) {
+            wait_lock.unlock();
+            ggml_vk_load_shaders(device, wait_pipeline);
+        }
     }
 }
 
