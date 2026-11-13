@@ -4147,9 +4147,26 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested, const
 
     // The first time a shader is used on this device, its size (_s/_m/_l) and
     // column-count variants are usually needed soon after, so they are compiled
-    // in the background.
-    std::string requested_base;
-    bool requested_64b = false;
+    // in the background. This holds for the requested and the predicted pipelines.
+    auto sibling_key = [](const vk_pipeline_struct & p) {
+        std::string key = p.name;
+        const size_t n = key.size();
+        if (n > 2 && key[n - 2] == '_' && (key[n - 1] == 's' || key[n - 1] == 'm' || key[n - 1] == 'l')) {
+            key.resize(n - 2);
+        }
+#if defined(VK_EXT_shader_64bit_indexing)
+        if (p.is_64b_indexing) {
+            key += "#64";
+        }
+#endif
+        return key;
+    };
+    const auto & listed = device->pipeline_list;
+    auto first_use = [&](const vk_pipeline_struct & p) {
+        return !p.name.empty() && !device->pipeline_list_path.empty() &&
+               std::find(listed.begin(), listed.end(), p.identity) == listed.end();
+    };
+    std::set<std::string> sibling_keys;
     const void * requested_spv = nullptr;
     std::vector<uint32_t> requested_spec;
     std::vector<CompileTask> sibling_candidates;
@@ -4175,16 +4192,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested, const
         rebuild_tasks.resize(device->pipeline_list.size());
     }
     std::unordered_map<std::string, uint32_t> name_ordinals;
-    if (requested) {
-        requested_base = requested->name;
-        const size_t n = requested_base.size();
-        if (n > 2 && requested_base[n - 2] == '_' &&
-            (requested_base[n - 1] == 's' || requested_base[n - 1] == 'm' || requested_base[n - 1] == 'l')) {
-            requested_base.resize(n - 2);
+    if (requested && first_use(*requested)) {
+        sibling_keys.insert(sibling_key(*requested));
+    }
+    for (const auto & p : wanted) {
+        if (p && wanted_order.count(p.get()) && first_use(*p)) {
+            sibling_keys.insert(sibling_key(*p));
         }
-#if defined(VK_EXT_shader_64bit_indexing)
-        requested_64b = requested->is_64b_indexing;
-#endif
     }
 
     if (device->coopmat2) {
@@ -4433,11 +4447,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested, const
                                                     required_subgroup_size };
                     }
                 }
-                const std::string & n = pipeline->name;
-                const size_t b = requested_base.size();
-                if (requested && !pipeline->compiled && !pipeline->compile_pending && (i == 1) == requested_64b &&
-                    n.compare(0, b, requested_base) == 0 &&
-                    (n.size() == b || (n.size() == b + 2 && n[b] == '_' && (n[b + 1] == 's' || n[b + 1] == 'm' || n[b + 1] == 'l')))) {
+                if (!sibling_keys.empty() && !pipeline->compiled && !pipeline->compile_pending &&
+                    sibling_keys.count(sibling_key(*pipeline))) {
                     sibling_candidates.push_back({ pipeline, spv_size, spv_data, entrypoint, parameter_count, wg_denoms,
                                                    specialization_constants, disable_robustness, require_full_subgroups,
                                                    required_subgroup_size });
@@ -6133,21 +6144,32 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested, const
         }
     }
 
-    const auto & listed = device->pipeline_list;
-    if (requested_spv && !device->pipeline_list_path.empty() &&
-        std::find(listed.begin(), listed.end(), requested->identity) == listed.end()) {
-        const auto & spec = requested_spec;
+    auto queue_siblings = [&](const vk_pipeline_struct & base, const void * spv, const std::vector<uint32_t> & spec) {
+        if (!spv || !first_use(base)) {
+            return;
+        }
         for (auto & c : sibling_candidates) {
-            const bool same_shader = c.spv_data == requested_spv;
-            const bool other_size = c.pipeline->name != requested->name;
+            if (!c.pipeline || c.pipeline->compile_pending || c.spv_data != spv ||
+                sibling_key(*c.pipeline) != sibling_key(base)) {
+                continue;
+            }
+            const bool other_size = c.pipeline->name != base.name;
             const bool other_cols = !other_size && !spec.empty() &&
                                     c.specialization_constants.size() == spec.size() &&
                                     std::equal(spec.begin(), spec.end() - 1, c.specialization_constants.begin()) &&
                                     c.specialization_constants.back() != spec.back();
-            if (same_shader && (other_size || other_cols) && !c.pipeline->compile_pending) {
+            if (other_size || other_cols) {
                 c.pipeline->compile_pending = true;
                 device->prefetch_queue.push_back(std::move(c));
             }
+        }
+    };
+    if (requested) {
+        queue_siblings(*requested, requested_spv, requested_spec);
+    }
+    for (const auto & t : wanted_tasks) {
+        if (t.pipeline) {
+            queue_siblings(*t.pipeline, t.spv_data, t.specialization_constants);
         }
     }
 
