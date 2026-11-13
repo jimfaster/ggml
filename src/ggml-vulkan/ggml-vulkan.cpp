@@ -6203,11 +6203,17 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested, const
     if (!wanted_order.empty()) {
         size_t queued = 0;
         for (auto & t : wanted_tasks) {
-            if (t.pipeline && !t.pipeline->compiled && !t.pipeline->compile_pending) {
+            if (!t.pipeline || t.pipeline->compiled) {
+                continue;
+            }
+            if (!t.pipeline->compile_pending) {
                 t.pipeline->compile_pending = true;
                 device->urgent_compiles++;
                 device->prefetch_queue.push_back(std::move(t));
                 queued++;
+            } else if (t.pipeline->compile_deferred) {
+                t.pipeline->compile_deferred = false;
+                device->urgent_compiles++;
             }
         }
         auto & q = device->prefetch_queue;
