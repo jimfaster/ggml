@@ -4147,8 +4147,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // lock until we're done deciding what to compile.
     std::unique_lock<std::mutex> compile_lock(device->compile_mutex);
 
-    // Size (_s/_m/_l) and column-count variants of the requested shader are
-    // usually needed soon after it, so they are compiled in the background.
+    // The first time a shader is used on this device, its size (_s/_m/_l) and
+    // column-count variants are usually needed soon after, so they are compiled
+    // in the background.
     std::string requested_base;
     bool requested_64b = false;
     std::vector<CompileTask> sibling_candidates;
@@ -6112,7 +6113,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
-    if (has_claimed_task) {
+    const auto & listed = device->pipeline_list;
+    if (has_claimed_task && std::find(listed.begin(), listed.end(), claimed_task.pipeline->identity) == listed.end()) {
         const auto & spec = claimed_task.specialization_constants;
         for (auto & c : sibling_candidates) {
             const bool same_shader = c.spv_data == claimed_task.spv_data;
