@@ -327,6 +327,7 @@ static void ggml_vk_write_pipeline_cache(const std::string & path, const std::ve
         std::ofstream f(partial, std::ios::binary | std::ios::trunc);
         if (!f.is_open()) return;
         f.write(reinterpret_cast<const char*>(data.data()), (std::streamsize)data.size());
+        f.close();
         if (!f) return;
     }
     std::error_code ec;
@@ -815,6 +816,7 @@ struct vk_device_struct {
     std::deque<CompileTask> prefetch_queue;
     uint32_t prefetch_workers {};
     std::mutex pipeline_cache_write_mutex;
+    std::mutex pipeline_list_write_mutex;
 
     vk::PhysicalDevice physical_device;
     vk::PhysicalDeviceProperties properties;
@@ -1196,7 +1198,7 @@ static void ggml_vk_save_pipeline_cache(vk_device_struct & device) {
 }
 
 static void ggml_vk_save_pipeline_list(vk_device_struct & device) {
-    std::lock_guard<std::mutex> write_guard(device.pipeline_cache_write_mutex);
+    std::lock_guard<std::mutex> write_guard(device.pipeline_list_write_mutex);
     std::string text;
     {
         std::lock_guard<std::mutex> guard(device.compile_mutex);
@@ -2060,7 +2062,8 @@ struct ggml_vk_garbage_collector {
 };
 
 static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subctx);
-static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested = nullptr);
+static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested = nullptr, const std::vector<vk_pipeline> & wanted = {});
+static std::vector<vk_pipeline> ggml_vk_predict_pipelines(ggml_backend_vk_context * ctx);
 static void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx);
 
 static bool vk_memory_logger_enabled = false;
@@ -2353,6 +2356,10 @@ struct ggml_backend_vk_context {
     int fused_ops_write_mask {};
     topk_moe_mode fused_topk_moe_mode {};
     bool fused_topk_moe_scale {};
+
+    ggml_cgraph * lookahead_graph {};
+    int lookahead_node {};
+    std::vector<vk_pipeline> * predict {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -3035,7 +3042,11 @@ static void ggml_pipeline_request_descriptor_sets(ggml_backend_vk_context *ctx, 
     VK_LOG_DEBUG("ggml_pipeline_request_descriptor_sets(" << pipeline->name << ", " << n << ")");
     ctx->pipeline_descriptor_set_requirements += n;
     if (!pipeline->compiled) {
-        ggml_vk_load_shaders(ctx->device, pipeline);
+        std::vector<vk_pipeline> wanted;
+        if (ctx->lookahead_graph) {
+            wanted = ggml_vk_predict_pipelines(ctx);
+        }
+        ggml_vk_load_shaders(ctx->device, pipeline, wanted);
     }
     if (!pipeline->listed.load(std::memory_order_relaxed)) {
         vk_device & device = ctx->device;
@@ -4093,7 +4104,7 @@ static void ggml_vk_prefetch_worker(vk_device device) {
     }
 }
 
-static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested, const std::vector<vk_pipeline> & wanted) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
     // some shaders have a minimum subgroup size
@@ -4139,7 +4150,19 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // in the background.
     std::string requested_base;
     bool requested_64b = false;
+    const void * requested_spv = nullptr;
+    std::vector<uint32_t> requested_spec;
     std::vector<CompileTask> sibling_candidates;
+
+    // Pipelines the rest of the current graph will ask for, compiled by background
+    // workers in graph order while this thread compiles the requested one.
+    std::unordered_map<const vk_pipeline_struct *, size_t> wanted_order;
+    for (const auto & p : wanted) {
+        if (p && !p->compiled && p != requested) {
+            wanted_order.emplace(p.get(), wanted_order.size());
+        }
+    }
+    std::vector<CompileTask> wanted_tasks(wanted_order.size());
 
     // After a driver change the remembered pipelines are rebuilt in the background,
     // in the order they were first used.
@@ -4402,6 +4425,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     }
                     continue;
                 }
+                if (!pipeline->compiled && !pipeline->compile_pending) {
+                    auto w = wanted_order.find(pipeline.get());
+                    if (w != wanted_order.end()) {
+                        wanted_tasks[w->second] = { pipeline, spv_size, spv_data, entrypoint, parameter_count, wg_denoms,
+                                                    specialization_constants, disable_robustness, require_full_subgroups,
+                                                    required_subgroup_size };
+                    }
+                }
                 const std::string & n = pipeline->name;
                 const size_t b = requested_base.size();
                 if (requested && !pipeline->compiled && !pipeline->compile_pending && (i == 1) == requested_64b &&
@@ -4414,6 +4445,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 continue;
             }
 
+            requested_spv = spv_data;
+            requested_spec = specialization_constants;
             if (pipeline->compiled) {
                 continue;
             }
@@ -6101,11 +6134,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 
     const auto & listed = device->pipeline_list;
-    if (has_claimed_task && std::find(listed.begin(), listed.end(), claimed_task.pipeline->identity) == listed.end()) {
-        const auto & spec = claimed_task.specialization_constants;
+    if (requested_spv && !device->pipeline_list_path.empty() &&
+        std::find(listed.begin(), listed.end(), requested->identity) == listed.end()) {
+        const auto & spec = requested_spec;
         for (auto & c : sibling_candidates) {
-            const bool same_shader = c.spv_data == claimed_task.spv_data;
-            const bool other_size = c.pipeline->name != claimed_task.pipeline->name;
+            const bool same_shader = c.spv_data == requested_spv;
+            const bool other_size = c.pipeline->name != requested->name;
             const bool other_cols = !other_size && !spec.empty() &&
                                     c.specialization_constants.size() == spec.size() &&
                                     std::equal(spec.begin(), spec.end() - 1, c.specialization_constants.begin()) &&
@@ -6117,7 +6151,37 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
+    if (!wanted_order.empty()) {
+        size_t queued = 0;
+        for (auto & t : wanted_tasks) {
+            if (t.pipeline && !t.pipeline->compiled && !t.pipeline->compile_pending) {
+                t.pipeline->compile_pending = true;
+                device->prefetch_queue.push_back(std::move(t));
+                queued++;
+            }
+        }
+        auto & q = device->prefetch_queue;
+        auto rest = std::stable_partition(q.begin(), q.end(), [&](const CompileTask & t) {
+            return wanted_order.count(t.pipeline.get()) != 0;
+        });
+        std::sort(q.begin(), rest, [&](const CompileTask & a, const CompileTask & b) {
+            return wanted_order.at(a.pipeline.get()) < wanted_order.at(b.pipeline.get());
+        });
+        if (std::getenv("GGML_VK_PIPELINE_CACHE_DEBUG")) {
+            std::fprintf(stderr, "ggml_vulkan: %s needed, %zu more predicted for this graph, %zu newly queued, %zu at the front\n",
+                         requested->name.c_str(), wanted_order.size(), queued, (size_t)(rest - q.begin()));
+        }
+    }
+
+    bool save_list = false;
     if (!requested && device->pipeline_list_build != device->pipeline_build) {
+        std::vector<std::string> kept;
+        for (size_t i = 0; i < rebuild_tasks.size(); ++i) {
+            if (rebuild_tasks[i].pipeline) {
+                kept.push_back(device->pipeline_list[i]);
+            }
+        }
+        device->pipeline_list = std::move(kept);
         size_t queued = 0;
         for (auto & t : rebuild_tasks) {
             if (t.pipeline && !t.pipeline->compiled && !t.pipeline->compile_pending) {
@@ -6132,6 +6196,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
         if (queued == 0) {
             device->pipeline_list_build = device->pipeline_build;
+            save_list = true;
         }
     }
 
@@ -6139,13 +6204,17 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const uint32_t hc = std::thread::hardware_concurrency();
         const uint32_t max_workers = hc > 2 ? hc - 1 : 1;
         while (device->prefetch_workers < max_workers && device->prefetch_workers < device->prefetch_queue.size()) {
+            std::thread worker(ggml_vk_prefetch_worker, device);
             device->prefetch_workers++;
-            std::thread(ggml_vk_prefetch_worker, device).detach();
+            worker.detach();
         }
     }
 
     // Drop compile_mutex so other threads can walk while we compile.
     compile_lock.unlock();
+    if (save_list) {
+        ggml_vk_save_pipeline_list(*device);
+    }
 
     // Compile what we claimed; create_pipeline_func reacquires compile_mutex
     // at the end to flip compile_pending/compiled and notify waiters.
@@ -6990,7 +7059,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 if (!device->pipeline_list.empty()) {
                     device->pipeline_list_build = list_build;
                 }
-                if (device->pipeline_list_build != device->pipeline_build) {
+                const size_t list_at = list_build.find(" build ");
+                const bool same_shaders = list_at != std::string::npos &&
+                                          list_build.substr(list_at) == device->pipeline_build.substr(device->pipeline_build.find(" build "));
+                if (device->pipeline_list_build != device->pipeline_build && same_shaders) {
                     for (const auto & identity : device->pipeline_list) {
                         unsigned v[16];
                         if (std::sscanf(identity.c_str(), GGML_VK_FA_IDENTITY_FORMAT, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5],
@@ -7002,6 +7074,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
                         s.shmem_staging = v[6] != 0; s.path = (FaCodePath)v[7]; s.workgroup_size = v[8]; s.subgroup_size = v[9];
                         s.aligned = v[10] != 0; s.f32acc = v[11] != 0; s.flags = v[12]; s.limit_occupancy_shmem = v[13];
                         s.k_type = (ggml_type)v[14]; s.v_type = (ggml_type)v[15];
+                        if (device->subgroup_size_control && s.subgroup_size != 0 &&
+                            (s.subgroup_size < device->subgroup_min_size || s.subgroup_size > device->subgroup_max_size)) {
+                            continue;
+                        }
                         device->pipeline_flash_attn_f32_f16.emplace(s, std::make_shared<vk_pipeline_struct>());
                     }
                 }
@@ -9337,6 +9413,23 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
     }
 
+    if (ctx->predict) {
+        ctx->predict->push_back(pipeline);
+        if (qx_needs_dequant) {
+            ctx->predict->push_back(to_fp16_vk_0);
+        }
+        if (qy_needs_dequant) {
+            ctx->predict->push_back(to_fp16_vk_1);
+        }
+        if (quantize_y) {
+            ctx->predict->push_back(to_q8_1);
+        }
+        if (split_k > 1) {
+            ctx->predict->push_back(ctx->device->pipeline_matmul_split_k_reduce);
+        }
+        return;
+    }
+
     {
         const uint64_t split_k_size = split_k > 1 ? d_sz * split_k : 0;
         if (
@@ -9649,6 +9742,20 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     const uint64_t x_sz = x_non_contig ? ggml_vk_align_size(ggml_type_size(src0->type) * x_ne, ctx->device->properties.limits.minStorageBufferOffsetAlignment) : qx_sz;
     const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) :
                          (f16_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
+
+    if (ctx->predict) {
+        ctx->predict->push_back(dmmv);
+        if (qx_needs_dequant) {
+            ctx->predict->push_back(to_fp16_vk_0);
+        }
+        if (qy_needs_dequant) {
+            ctx->predict->push_back(to_fp16_vk_1);
+        }
+        if (quantize_y) {
+            ctx->predict->push_back(to_q8_1);
+        }
+        return;
+    }
 
     {
         if (
@@ -10087,7 +10194,9 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
             m_offset += cur_M_size;
         }
     } else if (ggml_vk_can_use_fwht(ctx, src1, dst)) {
-        ggml_vk_fwht(ctx, subctx, src1, dst);
+        if (!ctx->predict) {
+            ggml_vk_fwht(ctx, subctx, src1, dst);
+        }
     } else if (src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1 &&
         // detect 0213 permutation, and batch size of 1
         src0->nb[0] <= src0->nb[2] &&
@@ -10100,13 +10209,17 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
         src1->ne[3] == 1 &&
         src0->ne[1] <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
         src1->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
-        ggml_vk_mul_mat_vec_p021_f16_f32(ctx, subctx, cgraph, node_idx);
+        if (!ctx->predict) {
+            ggml_vk_mul_mat_vec_p021_f16_f32(ctx, subctx, cgraph, node_idx);
+        }
     } else if (src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && dst->ne[1] == 1 &&
                !ggml_is_permuted(src0) && !ggml_is_permuted(src1) &&
                src0->ne[3] <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
                src0->ne[1] <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
                src1->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
-        ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, cgraph, node_idx);
+        if (!ctx->predict) {
+            ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, cgraph, node_idx);
+        }
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
     } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
@@ -10944,6 +11057,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 
     assert(pipeline);
+    if (ctx->predict) {
+        ctx->predict->push_back(pipeline);
+        return;
+    }
     // Compile early to initialize wg_denoms.
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
@@ -16872,6 +16989,55 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+static std::vector<vk_pipeline> ggml_vk_predict_pipelines(ggml_backend_vk_context * ctx) {
+    ggml_cgraph * cgraph = ctx->lookahead_graph;
+    ctx->lookahead_graph = nullptr;
+
+    const int fused_ops = ctx->num_additional_fused_ops;
+    const int write_mask = ctx->fused_ops_write_mask;
+    const topk_moe_mode topk_mode = ctx->fused_topk_moe_mode;
+    const bool topk_scale = ctx->fused_topk_moe_scale;
+    const bool rms_partials = ctx->do_add_rms_partials;
+    ctx->num_additional_fused_ops = 0;
+    ctx->fused_ops_write_mask = 0;
+    ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
+    ctx->fused_topk_moe_scale = false;
+    ctx->do_add_rms_partials = false;
+
+    std::vector<vk_pipeline> wanted;
+    ctx->predict = &wanted;
+    vk_context subctx;
+    for (int i = ctx->lookahead_node; i < cgraph->n_nodes; ++i) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        switch (node->op) {
+            case GGML_OP_MUL_MAT:
+                ggml_vk_mul_mat(ctx, subctx, cgraph, i);
+                break;
+            case GGML_OP_FLASH_ATTN_EXT:
+                ggml_vk_flash_attn(ctx, subctx, node->src[0], node->src[1], node->src[2], node->src[3], node->src[4], node);
+                break;
+            case GGML_OP_MUL_MAT_ID:
+                break;
+            default:
+                if (vk_pipeline p = ggml_vk_op_get_pipeline(ctx, node->src[0], node->src[1], node->src[2], node, node->op)) {
+                    wanted.push_back(p);
+                }
+                break;
+        }
+    }
+    ctx->predict = nullptr;
+
+    ctx->num_additional_fused_ops = fused_ops;
+    ctx->fused_ops_write_mask = write_mask;
+    ctx->fused_topk_moe_mode = topk_mode;
+    ctx->fused_topk_moe_scale = topk_scale;
+    ctx->do_add_rms_partials = rms_partials;
+    return wanted;
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -16965,6 +17131,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
 
+    ctx->lookahead_graph = cgraph;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (first_node_in_batch) {
             submit_node_idx = i;
@@ -17190,6 +17357,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
+        ctx->lookahead_node = i;
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
 
         if (vk_perf_logger_enabled && enqueued) {
@@ -17230,6 +17398,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->num_additional_fused_ops = 0;
         ctx->fused_ops_write_mask = 0;
     }
+    ctx->lookahead_graph = nullptr;
 
     ctx->last_total_flops = total_flops;
 
